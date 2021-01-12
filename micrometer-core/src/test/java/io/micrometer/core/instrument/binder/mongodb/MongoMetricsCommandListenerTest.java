@@ -22,7 +22,9 @@ import com.mongodb.event.ClusterListenerAdapter;
 import com.mongodb.event.ClusterOpeningEvent;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Tags;
+import io.micrometer.core.instrument.search.MeterNotFoundException;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+
 import org.bson.Document;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -87,6 +89,78 @@ class MongoMetricsCommandListenerTest extends AbstractMongoDbTest {
                 "status", "FAILED"
         );
         assertThat(registry.get("mongodb.driver.commands").tags(tags).timer().count()).isEqualTo(1);
+    }
+
+    @Test
+    void shouldSupportConcurrentCommands() throws InterruptedException {
+        boolean concurrent = true;
+
+        for (int i = 0; i < 100; i++) {
+            Thread insertThread = new Thread(() -> mongo.getDatabase("test")
+                    .getCollection("testCol")
+                    .insertOne(new Document("testDoc", new Date())));
+
+            Thread updateThread = new Thread(() -> mongo.getDatabase("test")
+                    .getCollection("testCol")
+                    .updateOne(new Document("nonExistentField", "foobar"),
+                            new Document("$set", new Document("nonExistentField", "foobaz"))));
+
+            Thread deleteThread = new Thread(() -> mongo.getDatabase("test")
+                    .getCollection("testCol")
+                    .deleteOne(new Document("nonExistentField", "foobar")));
+
+            Thread dropIndexesThread = new Thread(() -> mongo.getDatabase("test")
+                    .getCollection("testCol")
+                    .dropIndex("nonExistentIndex"));
+
+            if (concurrent) {
+                insertThread.start();
+                updateThread.start();
+                deleteThread.start();
+                dropIndexesThread.start();
+
+                insertThread.join();
+                updateThread.join();
+                deleteThread.join();
+                dropIndexesThread.join();
+            } else {
+                insertThread.start();
+                insertThread.join();
+
+                updateThread.start();
+                updateThread.join();
+
+                deleteThread.start();
+                deleteThread.join();
+
+                dropIndexesThread.start();
+                dropIndexesThread.join();
+            }
+
+            int iterationsCompleted = i + 1;
+            long insertCommandCount = getCommandTimerStopCountSafe("insert");
+            long updateCommandCount = getCommandTimerStopCountSafe("update");
+            long deleteCommandCount = getCommandTimerStopCountSafe("delete");
+            long dropIndexesCommandCount = getCommandTimerStopCountSafe("dropIndexes");
+
+            String message = String.format(
+                    "iterationsCompleted=%d, insertCommandCount=%d, updateCommandCount=%d, deleteCommandCount=%d, dropIndexesCommandCount=%d",
+                    iterationsCompleted, insertCommandCount, updateCommandCount, deleteCommandCount, dropIndexesCommandCount);
+            System.out.println(message);
+
+            assertThat(insertCommandCount).isEqualTo(iterationsCompleted);
+            assertThat(updateCommandCount).isEqualTo(iterationsCompleted);
+            assertThat(deleteCommandCount).isEqualTo(iterationsCompleted);
+            assertThat(dropIndexesCommandCount).isEqualTo(iterationsCompleted);
+        }
+    }
+
+    private long getCommandTimerStopCountSafe(String command) {
+        try {
+            return registry.get("mongodb.driver.commands").tags(Tags.of("command", command)).timer().count();
+        } catch (MeterNotFoundException e) {
+            return 0L;
+        }
     }
 
     @AfterEach
